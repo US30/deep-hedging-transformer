@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.DS_Store
+.env
+*.pt
+*.pth
+checkpoints/*/
+logs/
+results/figs/*.png
+deephedge/notebooks/figs/*.png
+calibration/params.json
+.ipynb_checkpoints/
+*.ipynb
