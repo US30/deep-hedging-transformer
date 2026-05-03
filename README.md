@@ -90,7 +90,7 @@ Three **risk measures** (all differentiable — backprop flows through the Monte
 |------|---------|-----|
 | **Quadratic** | $\mathbb{E}[\text{PnL}^2]$ | Variance minimisation, fast convergence |
 | **Entropic** | $\frac{1}{\lambda}\log \mathbb{E}\!\left[e^{-\lambda\,\text{PnL}}\right]$ | Exponential utility; $\lambda$ = risk aversion |
-| **CVaR** ⭐ | $\mathbb{E}\!\left[-\text{PnL} \;\middle|\; -\text{PnL} \geq \text{VaR}_\alpha\right]$ | Tail risk; $\alpha = 5\%$ default |
+| **CVaR** ⭐ | $\mathbb{E}\left[-\text{PnL} \mid -\text{PnL} \geq \text{VaR}_\alpha\right]$ | Tail risk; $\alpha = 5\%$ default |
 
 CVaR (Conditional Value at Risk) is the primary metric — it penalises the worst $\alpha$-fraction of outcomes, directly relevant to what a risk manager monitors.
 
