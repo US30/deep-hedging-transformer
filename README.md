@@ -80,7 +80,7 @@ The Transformer's ability to attend to the entire path history (not just the mos
 
 Net P&L of the hedging strategy over one episode:
 
-$$\text{P\&L}_T = -\text{Payoff}(S_T) + \sum_{k=0}^{N-1} \delta_k \,(S_{k+1} - S_k) - \sum_{k=0}^{N-1} \varepsilon\, S_k\, |\delta_k - \delta_{k-1}|$$
+$$\text{PnL}_T = -\text{Payoff}(S_T) + \sum_{k=0}^{N-1} \delta_k \,(S_{k+1} - S_k) - \sum_{k=0}^{N-1} \varepsilon\, S_k\, |\delta_k - \delta_{k-1}|$$
 
 The three terms are: **short option** position, **delta hedge gain**, **transaction costs** ($\varepsilon = 10$ bps).
 
@@ -88,9 +88,9 @@ Three **risk measures** (all differentiable — backprop flows through the Monte
 
 | Loss | Formula | Use |
 |------|---------|-----|
-| **Quadratic** | $\mathbb{E}[\text{P\&L}^2]$ | Variance minimisation, fast convergence |
-| **Entropic** | $\frac{1}{\lambda}\log \mathbb{E}\!\left[e^{-\lambda\,\text{P\&L}}\right]$ | Exponential utility; $\lambda$ = risk aversion |
-| **CVaR** ⭐ | $\mathbb{E}\!\left[-\text{P\&L} \;\middle|\; -\text{P\&L} \geq \text{VaR}_\alpha\right]$ | Tail risk; $\alpha = 5\%$ default |
+| **Quadratic** | $\mathbb{E}[\text{PnL}^2]$ | Variance minimisation, fast convergence |
+| **Entropic** | $\frac{1}{\lambda}\log \mathbb{E}\!\left[e^{-\lambda\,\text{PnL}}\right]$ | Exponential utility; $\lambda$ = risk aversion |
+| **CVaR** ⭐ | $\mathbb{E}\!\left[-\text{PnL} \;\middle|\; -\text{PnL} \geq \text{VaR}_\alpha\right]$ | Tail risk; $\alpha = 5\%$ default |
 
 CVaR (Conditional Value at Risk) is the primary metric — it penalises the worst $\alpha$-fraction of outcomes, directly relevant to what a risk manager monitors.
 
@@ -130,7 +130,7 @@ Slope of $\log m(q,\Delta)$ vs $\log \Delta$ gives $qH$. Average over $q = 1, 2$
 
 - **Training period**: 2000–2021 — calibration + model training on simulated paths
 - **OOS period**: 2022–present — real SPX daily returns
-- **Evaluation**: roll 1-month hedging windows over real SPX; compare $\text{CVaR}_{5\%}$ with **bootstrap 95% confidence intervals** ($n = 2000$ resamples)
+- **Evaluation**: roll 1-month hedging windows over real SPX; compare $\text{CVaR}_{5}$ with **bootstrap 95% confidence intervals** ($n = 2000$ resamples)
 - **Stress tests**: 2020 COVID crash, 2022 rate-hike drawdown
 
 ---
@@ -198,7 +198,7 @@ requirements.txt
 | Differentiable simulation, autodiff training | Derivatives hedging, Greeks, delta neutrality |
 | GPU-batched Monte Carlo (PyTorch) | Risk measures: CVaR, entropic utility |
 | Calibration via Nelder-Mead / gradient descent | Vol surface, VIX term structure |
-| Bootstrap confidence intervals, OOS evaluation | P&L attribution, transaction cost modelling |
+| Bootstrap confidence intervals, OOS evaluation | PnL attribution, transaction cost modelling |
 | Ablation studies, hyperparameter search | Exotic payoffs: barrier, autocall |
 
 ---
