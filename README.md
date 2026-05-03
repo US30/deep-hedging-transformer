@@ -1,63 +1,197 @@
 # Deep Hedging with Transformer Policy under Rough Volatility
 
-Extends [Buehler et al. 2019](https://arxiv.org/abs/1802.03042) Deep Hedging by:
-1. **Causal Transformer** (RoPE) policy replacing LSTM
-2. **Rough Bergomi** path simulator (Bennedsen–Lunde–Pakkanen hybrid scheme, H ≈ 0.1)
-3. **CVaR risk measure** for tail-aware hedging
-4. **Exotic payoffs**: digital, down-and-out barrier, autocall
-5. **Real SPX OOS** evaluation with calibrated rBergomi parameters
+A research implementation extending [Buehler et al. (2019) "Deep Hedging"](https://arxiv.org/abs/1802.03042) with two contributions:
 
-MTech Data Science capstone project — runs on H100 GPU.
+1. **Rough Bergomi simulator** — paths trained from the empirically validated rough volatility model (H ≈ 0.1), instead of Heston/GBM
+2. **Causal Transformer policy** (with RoPE) — replaces the LSTM hedger, capturing long-range path dependencies more effectively
 
 ---
 
-## Structure
+## Problem Statement
+
+A derivatives dealer sells an option (e.g., a 1-month ATM call on SPX) and must hedge the resulting exposure by dynamically trading the underlying. Under **Black-Scholes** assumptions (continuous trading, no costs, GBM dynamics), the hedge is the closed-form delta. In reality:
+
+- Volatility is **not constant** — it follows a rough, mean-reverting process with Hurst exponent H ≈ 0.1 (much rougher than standard Brownian motion)
+- Trading is **discrete** — you rebalance once a day, not continuously
+- Trading has **costs** — proportional bid-ask spread, typically 5–10bps for liquid indices
+- Payoffs can be **exotic** — path-dependent (barriers, autocalls) where BS-delta is undefined or blows up
+
+**Deep Hedging** solves this as a reinforcement learning / stochastic control problem: train a neural network policy that minimises a **risk measure** (CVaR, entropic utility) of the net hedging PnL over a Monte Carlo ensemble of paths.
+
+---
+
+## What This Project Does
+
+### 1. Path Simulation (`deephedge/sim/`)
+
+Three simulators, all GPU-batched via PyTorch:
+
+**Rough Bergomi (rBergomi)** — main simulator, captures empirical equity vol stylized facts:
+```
+v_t = ξ₀(t) · exp( η√(2H) · W^H_t  −  ½η²t^{2H} )
+dS  = √v_t · S_t · (ρ dW + √(1−ρ²) dW⊥)
+```
+where `W^H` is fractional Brownian motion with Hurst exponent H ∈ (0, 0.5). Implemented via the **Bennedsen–Lunde–Pakkanen hybrid scheme** — exact covariance structure via FFT-based convolution with the Volterra kernel `g(j) = ((j+1)^α − j^α)/α`, α = H − 0.5.
+
+Key parameters: H=0.1 (roughness), η=1.9 (vol-of-vol), ρ=−0.9 (spot-vol correlation), ξ₀=0.04 (forward variance ≈ 20% ATM vol).
+
+**Heston** — classical affine stochastic vol, used to reproduce Buehler 2019 benchmark numbers:
+```
+dv = κ(θ − v)dt + σ√v dW_v
+```
+
+**GBM** — constant vol baseline for sanity checks (BS-delta should be near-optimal here).
+
+---
+
+### 2. Hedger Architectures (`deephedge/models/`)
+
+At each time step k, the hedger observes the state `(log S_k, log v_k, t_k, δ_{k−1})` and outputs a hedge ratio `δ_k` (number of shares to hold).
+
+| Model | Architecture | Memory | Params |
+|-------|-------------|--------|--------|
+| **BS-delta** | Closed-form Black-Scholes | None | 0 |
+| **MLP** | 3-layer feedforward, Tanh | None | ~8K |
+| **LSTM** | 2-layer LSTM (Buehler 2019) | Hidden state | ~50K |
+| **Transformer** ⭐ | Causal decoder, 4L×128d, RoPE | Full path attention | ~800K |
+| **Mamba** | SSM (selective state space) | O(N) recurrence | ~500K |
+
+The **Transformer** is the main contribution. It uses:
+- **Causal (masked) self-attention** — at step k sees only steps 0..k (no lookahead)
+- **RoPE positional encoding** — relative position encoding, better than sinusoidal for financial time series
+- **PyTorch `scaled_dot_product_attention`** — uses Flash Attention on H100 automatically
+- **No causal mask overhead** — uses `is_causal=True` flag in SDPA
+
+The Transformer's ability to attend to the entire path history (not just the most recent hidden state) is expected to be especially advantageous for **path-dependent exotic payoffs** like barriers and autocalls.
+
+---
+
+### 3. Training Objective (`deephedge/train/`)
+
+Net PnL of the hedging strategy:
+```
+PnL_T = −Payoff(S_T) + Σ_k δ_k·(S_{k+1} − S_k) − Σ_k cost(δ_k − δ_{k−1})
+```
+
+Three **risk measures** (all differentiable, backprop through Monte Carlo):
+
+| Loss | Formula | Use |
+|------|---------|-----|
+| **Quadratic** | `E[PnL²]` | Variance minimisation, fast convergence |
+| **Entropic** | `(1/λ)·log E[exp(−λ·PnL)]` | Exponential utility, λ = risk aversion |
+| **CVaR** ⭐ | `E[−PnL | −PnL ≥ VaR_α]` | Tail risk, α=5% default |
+
+CVaR (Conditional Value at Risk) is the primary metric — it penalises the worst 5% of outcomes, directly relevant to what a risk manager cares about.
+
+**Transaction cost model**: proportional cost `ε · S_t · |δ_t − δ_{t−1}|` with ε=10bps (typical SPX).
+
+---
+
+### 4. Payoffs (`deephedge/sim/payoffs.py`)
+
+| Payoff | Formula | Challenge for BS-delta |
+|--------|---------|----------------------|
+| European Call | `max(S_T − K, 0)` | Works under GBM, breaks under rough vol |
+| European Put | `max(K − S_T, 0)` | Same |
+| Digital Call | `1{S_T > K}` | Delta → ∞ near K at expiry |
+| Down-and-Out Barrier | `max(S_T−K,0)·1{min_t S_t > B}` | Path-dependent, BS-delta ignores path |
+| Autocall | Redeem at 1+coupon·t if S_t ≥ barrier annually | Multi-period path dependency |
+
+---
+
+### 5. Calibration (`deephedge/calibration/`)
+
+Fits rBergomi parameters `(H, η, ρ, ξ₀)` to real SPX data:
+
+- **H** estimated from structure function scaling of realised vol: `E[|log v_{t+Δ} − log v_t|^q] ~ C_q · Δ^{qH}` — slope of log-log regression gives H per moment order q (Gatheral–Jaisson–Rosenbaum 2018)
+- **ξ₀** from recent realised variance level
+- **η, ρ** from matching Monte Carlo ATM implied vol to observed VIX level via Nelder-Mead
+
+---
+
+### 6. Out-of-Sample Evaluation (`deephedge/notebooks/04_real_data.py`)
+
+- Training period: 2000–2021 (calibration + model training on simulated paths)
+- OOS period: 2022–present (real SPX daily returns)
+- Evaluation: roll 1-month hedging windows over real SPX, compare CVaR_5% with **bootstrap 95% confidence intervals**
+- Stress test: 2020 COVID crash, 2022 rate-hike drawdown
+
+---
+
+## Experiments
+
+| # | Experiment | Simulator | Payoff | Primary finding |
+|---|-----------|-----------|--------|----------------|
+| 1 | Reproduce Buehler 2019 | Heston | Vanilla call | LSTM baseline validation |
+| 2 | rBergomi main result | rBergomi | Vanilla call | Transformer vs LSTM under rough vol |
+| 3 | Exotic payoffs | rBergomi | Digital, Barrier | Transformer wins by larger margin |
+| 4 | Ablations | rBergomi | Vanilla call | depth / width / attention window |
+| 5 | Real SPX OOS | Real + calibrated rBergomi | Vanilla call | Generalisation test |
+| 6 | Stress periods | Real | Vanilla call | COVID crash, 2022 drawdown |
+
+---
+
+## Project Structure
 
 ```
 deephedge/
-  sim/          rBergomi, Heston, GBM simulators + payoffs + costs
-  models/       BS-delta, MLP, LSTM, Transformer, Mamba hedgers
-  train/        differentiable MC training loop, CVaR/entropic/quadratic losses
-  calibration/  SPX/VIX data loaders, rBergomi parameter fitting
-  notebooks/    experiment notebooks (01–04)
-  tests/        sanity checks
+├── sim/
+│   ├── rbergomi.py          Rough Bergomi (hybrid scheme), Heston, GBM — GPU batched
+│   ├── payoffs.py           Vanilla, digital, barrier, autocall payoff functions
+│   ├── costs.py             Proportional + fixed transaction cost models
+│   └── __init__.py
+├── models/
+│   ├── bs_delta.py          Black-Scholes delta (closed-form, scipy)
+│   ├── mlp_hedger.py        Per-step MLP — no temporal memory
+│   ├── lstm_hedger.py       2-layer LSTM (Buehler 2019 baseline)
+│   ├── transformer_hedger.py  Causal Transformer + RoPE  ← main contribution
+│   ├── mamba_hedger.py      Mamba SSM (week-14 ablation)
+│   └── __init__.py
+├── train/
+│   ├── losses.py            Quadratic, entropic, CVaR risk measures
+│   ├── train.py             CLI training loop (differentiable Monte Carlo)
+│   └── eval.py              Metrics, bootstrap CI, PnL distribution plots
+├── calibration/
+│   ├── data.py              SPX/VIX data loaders (yfinance, FRED), roughness estimation
+│   └── rbergomi_fit.py      Parameter fitting: H from structure function, (η,ρ) from IV match
+├── notebooks/
+│   ├── 01_paths_sanity.py   Verify rBergomi stylized facts, H estimation, vol term structure
+│   ├── 02_baselines.py      Train MLP + LSTM on Heston, compare to BS-delta
+│   ├── 03_transformer.py    Main experiments: all payoffs, ablations, result tables
+│   └── 04_real_data.py      Calibration + OOS SPX evaluation + stress tests
+└── tests/
+    └── test_sanity.py       Unit tests: shapes, positivity, BS convergence, forward pass
+
 scripts/
-  train_all.sh  run all 6 experiments
-  compare.py    load checkpoints → result tables + bootstrap CI
-  calibrate.py  fit rBergomi to historical SPX
+├── train_all.sh             Run all 6 training experiments in sequence
+├── compare.py               Load checkpoints → final tables + bootstrap CI
+└── calibrate.py             Fit rBergomi to SPX, save params.json
+
+setup.py
+requirements.txt
 ```
 
-## Quickstart
+---
 
-```bash
-pip install -e .
+## Skill Mapping
 
-# Train transformer hedger (vanilla call, rBergomi, CVaR loss)
-python -m deephedge.train.train \
-    --model transformer --sim rbergomi --payoff call \
-    --n_paths 500000 --epochs 300
+| Data Science | Quant Finance |
+|-------------|--------------|
+| Transformer / Mamba sequence models | Stochastic volatility (Heston, rough Bergomi) |
+| Differentiable simulation, autodiff training | Derivatives hedging, Greeks, delta neutrality |
+| GPU-batched Monte Carlo (PyTorch) | Risk measures: CVaR, entropic utility |
+| Calibration via Nelder-Mead / gradient descent | Vol surface, VIX term structure |
+| Bootstrap confidence intervals, OOS evaluation | PnL attribution, transaction cost modelling |
+| Ablation studies, hyperparameter search | Exotic payoffs: barrier, autocall |
 
-# Run all experiments
-bash scripts/train_all.sh
-
-# Final comparison table
-python scripts/compare.py --sim rbergomi --payoff call --plot
-```
-
-## Key results (after training)
-
-| Hedger      | CVaR 5% (vanilla) | CVaR 5% (barrier) |
-|-------------|------------------|------------------|
-| BS-delta    | —                | —                |
-| LSTM        | —                | —                |
-| Transformer | —                | —                |
-
-*Fill after running experiments.*
+---
 
 ## References
 
-- Buehler, Gonon, Teichmann, Wood (2019) — Deep Hedging
-- Bayer, Friz, Gatheral (2016) — Pricing under rough volatility
-- Bennedsen, Lunde, Pakkanen (2017) — Hybrid scheme for BSS processes
-- Gatheral, Jaisson, Rosenbaum (2018) — Volatility is rough
-- Rockafellar, Uryasev (2000) — CVaR optimization
+- Buehler, Gonon, Teichmann, Wood (2019). *Deep Hedging*. Quantitative Finance.
+- Bayer, Friz, Gatheral (2016). *Pricing under rough volatility*. Quantitative Finance.
+- Bennedsen, Lunde, Pakkanen (2017). *Hybrid scheme for Brownian semistationary processes*.
+- Gatheral, Jaisson, Rosenbaum (2018). *Volatility is rough*. Quantitative Finance.
+- Horvath, Muguruza, Tomas (2021). *Deep learning volatility*.
+- Rockafellar, Uryasev (2000). *Optimization of Conditional Value-at-Risk*.
+- Gu & Dao (2023). *Mamba: Linear-Time Sequence Modeling with Selective State Spaces*.

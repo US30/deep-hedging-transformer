@@ -1,0 +1,155 @@
+==============================================================
+  Deep Hedging with Transformer Policy — How to Run
+==============================================================
+
+REQUIREMENTS
+------------
+  Python 3.10+
+  CUDA 12.x (H100)
+  ~40GB VRAM (default config)
+  ~50GB disk (checkpoints + logs)
+
+  Core packages: torch>=2.2, scipy, numpy, pandas, yfinance, matplotlib
+  Optional (week-14 ablation): mamba-ssm (CUDA only)
+
+
+STEP 1 — INSTALL
+----------------
+  git clone https://github.com/US30/deep-hedging-transformer
+  cd deep-hedging-transformer
+  pip install -e .
+
+  # OR install deps directly:
+  pip install -r deephedge/requirements.txt
+
+
+STEP 2 — VERIFY SETUP (CPU, fast)
+----------------------------------
+  python deephedge/tests/test_sanity.py
+
+  Expected output: "Passed: 11/11"
+  Takes ~1-2 min on CPU. If any test fails, check PyTorch install.
+
+
+STEP 3 — RUN NOTEBOOKS (exploration, one at a time)
+-----------------------------------------------------
+  Convert .py notebooks to .ipynb first:
+    pip install jupytext
+    jupytext --to notebook deephedge/notebooks/01_paths_sanity.py
+    jupyter notebook deephedge/notebooks/01_paths_sanity.ipynb
+
+  Notebook order:
+    01_paths_sanity.py    — verify simulators, estimate H (~10 min on H100)
+    02_baselines.py       — train MLP + LSTM on Heston (~2 hrs on H100)
+    03_transformer.py     — main experiments: all payoffs + ablations (~8 hrs)
+    04_real_data.py       — calibrate to SPX, OOS evaluation (~1 hr)
+
+
+STEP 4 — RUN ALL EXPERIMENTS (recommended)
+-------------------------------------------
+  bash scripts/train_all.sh
+
+  This runs 6 training jobs in sequence:
+    [1] MLP        | rBergomi | vanilla call
+    [2] LSTM       | rBergomi | vanilla call
+    [3] Transformer| rBergomi | vanilla call    ← main result
+    [4] Transformer| rBergomi | digital call
+    [5] Transformer| rBergomi | barrier call
+    [6] Transformer| Heston   | vanilla call    ← Buehler 2019 baseline
+
+  Checkpoints saved to: checkpoints/<model>_<sim>_<payoff>/
+  Logs saved to:        logs/<experiment>.log
+
+  Total runtime on H100 40GB: ~8-12 hours
+  Total checkpoint size: ~500MB
+
+
+STEP 5 — FINAL COMPARISON TABLE
+---------------------------------
+  python scripts/compare.py --sim rbergomi --payoff call --plot
+  python scripts/compare.py --sim rbergomi --payoff digital --plot
+  python scripts/compare.py --sim rbergomi --payoff barrier --plot
+
+  Outputs:
+    - Comparison table: PnL mean, std, VaR 95%, CVaR 5%, Sharpe
+    - Bootstrap 95% CI for CVaR (n_boot=2000)
+    - PnL distribution plots saved to results/figs/
+
+
+STEP 6 — CALIBRATE TO REAL SPX (for notebook 04)
+---------------------------------------------------
+  python scripts/calibrate.py --train_end 2021-12-31 --out calibration/params.json
+
+  Downloads SPX from Yahoo Finance (2000-2021).
+  Estimates H from structure function, fits (eta, rho) to VIX level.
+  Saves calibrated params to calibration/params.json.
+  Requires internet access.
+
+
+SINGLE-EXPERIMENT USAGE
+------------------------
+  Train one model manually:
+
+    python -m deephedge.train.train \
+        --model transformer \
+        --sim rbergomi \
+        --payoff call \
+        --n_paths 500000 \
+        --n_steps 30 \
+        --T 0.0833 \
+        --K 1.0 \
+        --epsilon 0.001 \
+        --loss cvar \
+        --alpha 0.05 \
+        --H 0.1 --eta 1.9 --rho -0.9 --xi0 0.04 \
+        --lr 3e-4 \
+        --epochs 300 \
+        --d_model 128 --n_heads 4 --n_layers 4 \
+        --save_dir checkpoints/my_run
+
+  All --model choices:     mlp | lstm | transformer
+  All --sim choices:       rbergomi | heston | gbm
+  All --payoff choices:    call | put | digital | barrier
+  All --loss choices:      quadratic | entropic | cvar
+
+
+MEMORY USAGE GUIDE (H100 40GB)
+--------------------------------
+  n_paths=500000, n_steps=30   → ~6GB  (default, fast)
+  n_paths=1000000, n_steps=252 → ~25GB (annual daily hedging)
+  n_paths=500000, n_steps=252  → ~12GB (annual daily hedging, recommended)
+
+  rBergomi FFT convolution uses ~2x more memory than Heston/GBM.
+  If OOM: reduce n_paths or use --n_steps 21 (1-month at daily freq).
+
+
+EXPECTED RESULTS (vanilla call, rBergomi, CVaR 5%)
+-----------------------------------------------------
+  After training completes, Transformer should outperform LSTM
+  and both should significantly outperform BS-delta due to:
+  - Rough vol misspecification in BS-delta (H=0.5 assumed, true H≈0.1)
+  - Discrete hedging + transaction costs not handled by BS
+
+  The gap widens for exotic payoffs (digital, barrier) where
+  BS-delta either diverges or is undefined.
+
+
+OPTIONAL: MAMBA ABLATION (week 14)
+------------------------------------
+  Install mamba-ssm (requires CUDA 12, specific torch version):
+    pip install mamba-ssm
+
+  Then train:
+    python -m deephedge.train.train \
+        --model transformer ...    # use transformer_hedger, swap to MambaHedger manually in train.py
+
+  Without mamba-ssm installed, MambaHedger silently falls back to GRU.
+
+
+TROUBLESHOOTING
+---------------
+  "CUDA out of memory"     → reduce --n_paths (try 200000)
+  "NaN loss"               → reduce --lr (try 1e-4), check --xi0 > 0
+  "import yfinance fails"  → pip install yfinance
+  "No module deephedge"    → run pip install -e . from repo root
+  rBergomi paths negative  → should not happen; file bug if v < 0
